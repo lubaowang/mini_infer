@@ -1,0 +1,22 @@
+# ─── 核心框架 ───────────────────────────────────────────────────
+torch>=2.1.0          # Triton 2.x 随 PyTorch 2.1+ 自动附带
+triton>=2.2.0         # 如需独立安装：pip install triton
+transformers>=4.40.0
+tokenizers>=0.15.0
+
+# ─── 数值 / 工具 ─────────────────────────────────────────────────
+numpy>=1.24.0
+einops>=0.7.0         # 张量变形工具，kernel 开发辅助
+pyyaml>=6.0           # 配置文件解析
+
+# ─── 推理加速（可选） ─────────────────────────────────────────────
+# flash-attn>=2.5.0   # 如有 CUDA 编译环境可启用，与 Triton flash attn 二选一
+# xformers>=0.0.24    # memory_efficient_attention fallback
+
+# ─── 测试 / 基准 ─────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-benchmark>=4.0.0
+tabulate>=0.9.0       # benchmark 结果表格输出
+
+# ─── Profiling ───────────────────────────────────────────────────
+# torch-tb-profiler   # TensorBoard profiler（可选）

@@ -1,0 +1,27 @@
+# configs/default.yaml
+# MiniMind Triton 推理引擎默认配置
+
+model:
+  hidden_size: 512
+  num_hidden_layers: 16
+  num_attention_heads: 8
+  num_key_value_heads: 2
+  vocab_size: 6400
+  use_moe: false
+
+engine:
+  max_seq: 2048          # KV Cache 最大序列长度（影响预分配显存）
+  dtype: "fp16"          # 推理精度：fp16 / bf16 / fp32
+  use_triton: true       # 是否启用 Triton 算子（false = 纯 PyTorch fallback）
+
+inference:
+  max_new_tokens: 512
+  temperature: 0.85
+  top_p: 0.85
+  do_sample: true
+  repetition_penalty: 1.0
+
+paths:
+  weight_dir: "out"
+  weight_name: "full_sft"   # full_sft / pretrain / rlhf / reason
+  tokenizer_path: "model/minimind_tokenizer"
