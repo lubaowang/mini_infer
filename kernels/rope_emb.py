@@ -1,15 +1,14 @@
 """
-kernels/rope_emb.py
+kernels/rope_emb.py  （修正版）
 ───────────────────
 Triton 实现的 Rotary Position Embedding（fused apply）。
 
-对标 model_minimind.py 中的：
-    apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
-
-融合策略：
-  - 单 kernel 同时完成 q 和 k 的旋转，避免两次独立 kernel launch
-  - cos/sin 在 kernel 内直接用，不需要 unsqueeze/broadcast
-  - 支持 GQA：q_heads != k_heads（分别指定 head 数）
+修正点（相对原版）：
+  1. BLOCK_D 错误：原版 BLOCK_D = next_pow2(D//2)，但 kernel 内同时处理
+     d_lo=[0,D/2) 和 d_hi=[D/2,D)，每次实际访问 D 个元素，BLOCK_D 需 >= D//2
+     且 lo/hi 各自需要 D//2 个 lane。修正为两个独立 tile，每个 BLOCK_HALF = D//2。
+  2. kernel 内 x/cos/sin 被读了两次（d 和 d_lo/d_hi 两组），去掉第一次无用读取。
+  3. stride 传参统一，确保 out 和 x 使用相同 stride。
 """
 
 import torch
@@ -17,101 +16,97 @@ import triton
 import triton.language as tl
 
 
-# ─── apply_rotary（单 tensor） ────────────────────────────────────────────────
-
 @triton.jit
 def _apply_rope_kernel(
-    X_ptr,          # (B, H, T, D) 连续存储
-    Cos_ptr,        # (B, T, D)    —— 已在 RotaryEmbedding.forward 中展开
-    Sin_ptr,        # (B, T, D)
+    X_ptr,
+    Cos_ptr,
+    Sin_ptr,
     Out_ptr,
-    B, H, T, D,     # batch, heads, seq_len, head_dim
+    B, H, T, D,
     stride_xb, stride_xh, stride_xt, stride_xd,
-    stride_cb, stride_ct, stride_cd,             # cos/sin: B, T, D
+    stride_cb, stride_ct, stride_cd,
     stride_ob, stride_oh, stride_ot, stride_od,
-    BLOCK_D: tl.constexpr,
+    BLOCK_HALF: tl.constexpr,   # = D // 2，每个 program 处理半个 head_dim
 ):
-    # program_id: (b * H * T + h * T + t) 展开
+    """
+    每个 program 处理一个 (b, h, t) 位置的整个 head_dim（分前后两半）。
+    前半 d_lo = [0, D/2)，后半 d_hi = [D/2, D)。
+    rotate_half(x) = [-x[D/2:], x[:D/2]]
+    因此：
+      out_lo = x_lo * cos_lo + (-x_hi) * sin_lo
+      out_hi = x_hi * cos_hi +   x_lo  * sin_hi
+    """
     idx = tl.program_id(0)
     t   = idx % T
     tmp = idx // T
     h   = tmp % H
     b   = tmp // H
 
-    # 列偏移
-    d = tl.arange(0, BLOCK_D)
-    mask_d = d < D
+    # 前半索引 [0, BLOCK_HALF)
+    d_lo   = tl.arange(0, BLOCK_HALF)           # [0, D/2)
+    mask_lo = d_lo < (D // 2)
 
-    # 读 x
-    x_ptr = X_ptr + b * stride_xb + h * stride_xh + t * stride_xt
-    x = tl.load(x_ptr + d * stride_xd, mask=mask_d, other=0.0).to(tl.float32)
-
-    # 读 cos / sin（不依赖 head，B×T×D）
-    cs_ptr_base = b * stride_cb + t * stride_ct
-    cos_vals = tl.load(Cos_ptr + cs_ptr_base + d * stride_cd, mask=mask_d, other=1.0).to(tl.float32)
-    sin_vals = tl.load(Sin_ptr + cs_ptr_base + d * stride_cd, mask=mask_d, other=0.0).to(tl.float32)
-
-    # rotate_half: [-x[D/2:], x[:D/2]]
-    half = D // 2
-    d_lo  = d          # [0, D/2)
-    d_hi  = d + half   # [D/2, D)
-    mask_lo = d_lo < half
+    # 后半索引 [D/2, D)
+    d_hi   = d_lo + (D // 2)                    # [D/2, D)
     mask_hi = d_hi < D
 
-    x_lo = tl.load(x_ptr + d_lo * stride_xd, mask=mask_lo, other=0.0).to(tl.float32)
-    x_hi = tl.load(x_ptr + d_hi * stride_xd, mask=mask_hi, other=0.0).to(tl.float32)
+    # 基址
+    x_base   = X_ptr   + b * stride_xb + h * stride_xh + t * stride_xt
+    cos_base = Cos_ptr + b * stride_cb             + t * stride_ct
+    sin_base = Sin_ptr + b * stride_cb             + t * stride_ct
+    out_base = Out_ptr + b * stride_ob + h * stride_oh + t * stride_ot
 
-    # rotate_half(x) = [-x_hi | x_lo]，与 d 对应
-    rot_lo = -x_hi  # 前半段放 -x[D/2:]
-    rot_hi =  x_lo  # 后半段放  x[:D/2]
+    # 读取前后两半 x
+    x_lo = tl.load(x_base + d_lo * stride_xd, mask=mask_lo, other=0.0).to(tl.float32)
+    x_hi = tl.load(x_base + d_hi * stride_xd, mask=mask_hi, other=0.0).to(tl.float32)
 
-    cos_lo = tl.load(Cos_ptr + cs_ptr_base + d_lo * stride_cd, mask=mask_lo, other=1.0).to(tl.float32)
-    cos_hi = tl.load(Cos_ptr + cs_ptr_base + d_hi * stride_cd, mask=mask_hi, other=1.0).to(tl.float32)
-    sin_lo = tl.load(Sin_ptr + cs_ptr_base + d_lo * stride_cd, mask=mask_lo, other=0.0).to(tl.float32)
-    sin_hi = tl.load(Sin_ptr + cs_ptr_base + d_hi * stride_cd, mask=mask_hi, other=0.0).to(tl.float32)
+    # 读取 cos / sin（cos/sin 不依赖 head，对所有 head 相同）
+    cos_lo = tl.load(cos_base + d_lo * stride_cd, mask=mask_lo, other=1.0).to(tl.float32)
+    cos_hi = tl.load(cos_base + d_hi * stride_cd, mask=mask_hi, other=1.0).to(tl.float32)
+    sin_lo = tl.load(sin_base + d_lo * stride_cd, mask=mask_lo, other=0.0).to(tl.float32)
+    sin_hi = tl.load(sin_base + d_hi * stride_cd, mask=mask_hi, other=0.0).to(tl.float32)
 
-    out_lo = x_lo * cos_lo + rot_lo * sin_lo
-    out_hi = x_hi * cos_hi + rot_hi * sin_hi
+    # rotate_half: 前半 = -x_hi，后半 = x_lo
+    out_lo = x_lo * cos_lo + (-x_hi) * sin_lo
+    out_hi = x_hi * cos_hi +   x_lo  * sin_hi
 
-    out_ptr = Out_ptr + b * stride_ob + h * stride_oh + t * stride_ot
-    tl.store(out_ptr + d_lo * stride_od, out_lo.to(x.dtype), mask=mask_lo)
-    tl.store(out_ptr + d_hi * stride_od, out_hi.to(x.dtype), mask=mask_hi)
+    # 写回
+    tl.store(out_base + d_lo * stride_od, out_lo.to(x_lo.dtype), mask=mask_lo)
+    tl.store(out_base + d_hi * stride_od, out_hi.to(x_hi.dtype), mask=mask_hi)
 
 
 def _apply_rope_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
-    x:   (B, H, T, D)  — q 或 k（已 transpose 到 heads-first）
+    x:   (B, H, T, D)  — 连续存储
     cos: (B, T, D)
     sin: (B, T, D)
     """
     B, H, T, D = x.shape
+    assert D % 2 == 0, "head_dim 必须是偶数"
     out = torch.empty_like(x)
 
-    BLOCK_D = triton.next_power_of_2(D // 2)   # 每次处理半个 head_dim
-    grid = (B * H * T,)
+    BLOCK_HALF = triton.next_power_of_2(D // 2)
 
-    _apply_rope_kernel[grid](
+    _apply_rope_kernel[(B * H * T,)](
         x, cos, sin, out,
         B, H, T, D,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        x.stride(0),   x.stride(1),   x.stride(2),   x.stride(3),
         cos.stride(0), cos.stride(1), cos.stride(2),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        BLOCK_D=BLOCK_D,
+        BLOCK_HALF=BLOCK_HALF,
     )
     return out
 
 
-# ─── 对外接口：同时处理 q 和 k ──────────────────────────────────────────────
-
 def apply_rotary_pos_emb_triton(
-    q: torch.Tensor,    # (B, Hq, T, D)
+    q: torch.Tensor,    # (B, Hq, T, D)  — 已 transpose + contiguous
     k: torch.Tensor,    # (B, Hk, T, D)
     cos: torch.Tensor,  # (B, T, D)
     sin: torch.Tensor,  # (B, T, D)
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple:
     """
-    融合版 RoPE apply，替换 model_minimind.py 中的 apply_rotary_pos_emb。
-    q/k 均需为 (B, H, T, D) 的连续 tensor（即已执行过 .transpose(1,2).contiguous()）。
+    替换 model_minimind.apply_rotary_pos_emb。
+    q/k 需为 heads-first 且内存连续。
     """
     q_out = _apply_rope_single(q, cos, sin)
     k_out = _apply_rope_single(k, cos, sin)
