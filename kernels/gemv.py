@@ -40,16 +40,18 @@ def _gemv_kernel(
         return
 
     # 分段累加，处理任意长度的 N_in
-    acc = tl.zeros([1], dtype=tl.float32)
+    acc = 0.0  # 标量！
+
     for k_start in range(0, N_in, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
         mask_k = k_offs < N_in
 
         a = tl.load(A_ptr + row * N_in + k_offs, mask=mask_k, other=0.0).to(tl.float32)
         x = tl.load(X_ptr + k_offs,              mask=mask_k, other=0.0).to(tl.float32)
+
         acc += tl.sum(a * x, axis=0)
 
-    tl.store(Out_ptr + row, acc.to(tl.float32))
+    tl.store(Out_ptr + row, acc)
 
 
 def gemv_triton(

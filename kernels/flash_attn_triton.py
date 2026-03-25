@@ -74,45 +74,49 @@ def _flash_attn_fwd_kernel(
     for tile_n in range(n_tiles_kv):
         kv_start = tile_n * BLOCK_N
         kv_offs  = kv_start + tl.arange(0, BLOCK_N)
-        mask_kv  = kv_offs < T_kv
 
-        # Causal 跳过：整个 tile 都在 query 之后 → 全是 -inf，可直接跳过
+        # base mask（padding）
+        mask_kv = kv_offs < T_kv
+
+        # === ✅ 替代 break：整块 tile 是否有效 ===
         if CAUSAL:
-            if kv_start > q_start + BLOCK_M - 1:
-                break
+            tile_valid = kv_start <= (q_start + BLOCK_M - 1)
+            mask_kv = mask_kv & tile_valid
 
-        # 读 K tile: (BLOCK_N, D)
+        # ---------------- K ----------------
         k = tl.load(
             K_base + kv_offs[:, None] * stride_kt + d_offs[None, :] * stride_kd,
             mask=mask_kv[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.float32)
 
-        # scores: (BLOCK_M, BLOCK_N) = Q @ K^T
-        scores = tl.dot(q, tl.trans(k))  # (BLOCK_M, BLOCK_N)
+        # scores: (BLOCK_M, BLOCK_N)
+        scores = tl.dot(q, tl.trans(k))
 
-        # Causal mask（tile 内部精细掩码）
+        # === causal mask（tile 内精细）===
         if CAUSAL:
             causal_mask = q_offs[:, None] >= kv_offs[None, :]
             scores = tl.where(causal_mask, scores, float("-inf"))
 
-        # 无效 KV padding 掩掉
+        # padding mask
         scores = tl.where(mask_kv[None, :], scores, float("-inf"))
 
-        # Online softmax 更新
+        # ---------------- online softmax ----------------
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
         exp_s = tl.exp(scores - m_new[:, None])
         l_new = tl.exp(m_i - m_new) * l_i + tl.sum(exp_s, axis=1)
 
-        # 读 V tile: (BLOCK_N, D)
+        # ---------------- V ----------------
         v = tl.load(
             V_base + kv_offs[:, None] * stride_vt + d_offs[None, :] * stride_vd,
             mask=mask_kv[:, None] & mask_d[None, :],
             other=0.0,
         ).to(tl.float32)
 
-        # acc 更新：rescale 旧 acc + exp(s) @ V
-        acc = acc * (tl.exp(m_i - m_new) * l_i / l_new)[:, None] + tl.dot(exp_s.to(v.dtype), v) / l_new[:, None]
+        # ---------------- acc update ----------------
+        acc = acc * (tl.exp(m_i - m_new) * l_i / l_new)[:, None] \
+            + tl.dot(exp_s.to(v.dtype), v) / l_new[:, None]
+
         m_i = m_new
         l_i = l_new
 

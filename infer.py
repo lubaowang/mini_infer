@@ -43,7 +43,7 @@ def parse_args():
     # 模型配置（与原 eval.py 保持接口兼容）
     parser.add_argument("--load_from",   default="model", type=str,
                         help="模型来源：'model'=原生 .pth 权重，其他路径=HuggingFace 格式")
-    parser.add_argument("--save_dir",    default="out",   type=str, help="权重目录")
+    parser.add_argument("--save_dir",    default="model",   type=str, help="权重目录")
     parser.add_argument("--weight",      default="full_sft", type=str,
                         help="权重名称前缀 (pretrain/full_sft/rlhf/reason)")
     parser.add_argument("--hidden_size", default=512,     type=int)
@@ -93,7 +93,8 @@ def init_engine(args):
             use_triton = False
 
     # ── 加载 tokenizer ──────────────────────────────────────────────────────
-    tok_path = args.load_from if "model" not in args.load_from else "model/minimind_tokenizer"
+    tok_path = args.load_from
+    print(tok_path)
     tokenizer = AutoTokenizer.from_pretrained(tok_path)
 
     # ── 构建模型 ────────────────────────────────────────────────────────────

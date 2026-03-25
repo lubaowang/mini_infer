@@ -5,7 +5,7 @@ scripts/convert_weights.py
 
 使用：
     python scripts/convert_weights.py \
-        --input  out/full_sft_512.pth \
+        --input  model/full_sft_512.pth \
         --output engine_weights/full_sft_512_fp16.pth \
         --dtype  fp16
 
